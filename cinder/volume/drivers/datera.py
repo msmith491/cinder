@@ -14,17 +14,18 @@
 #    under the License.
 
 import json
+from functools import wraps
 
 from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_utils import excutils
 from oslo_utils import units
+from cinder import utils
 import requests
 
 from cinder import exception
-from cinder.i18n import _, _LE, _LW
+from cinder.i18n import _, _LI, _LE, _LW
 from cinder.openstack.common import versionutils
-from cinder import utils
 from cinder.volume.drivers.san import san
 
 LOG = logging.getLogger(__name__)
@@ -39,7 +40,7 @@ d_opts = [
                default='7717',
                help='Datera API port.'),
     cfg.StrOpt('datera_api_version',
-               default='1',
+               default='2',
                help='Datera API version.'),
     cfg.StrOpt('datera_num_replicas',
                default='3',
@@ -53,37 +54,43 @@ CONF.import_opt('driver_client_cert', 'cinder.volume.driver')
 CONF.import_opt('driver_use_ssl', 'cinder.volume.driver')
 CONF.register_opts(d_opts)
 
+DEFAULT_STORAGE_NAME = 'storage-1'
+DEFAULT_VOLUME_NAME = 'volume-1'
+
 
 def _authenticated(func):
-        """Ensure the driver is authenticated to make a request.
+    """Ensure the driver is authenticated to make a request.
 
-        In do_setup() we fetch an auth token and store it. If that expires when
-        we do API request, we'll fetch a new one.
-        """
-        def func_wrapper(self, *args, **kwargs):
-            try:
-                return func(self, *args, **kwargs)
-            except exception.NotAuthorized:
-                # Prevent recursion loop. After the self arg is the
-                # resource_type arg from _issue_api_request(). If attempt to
-                # login failed, we should just give up.
-                if args[0] == 'login':
-                    raise
+    In do_setup() we fetch an auth token and store it. If that expires when
+    we do API request, we'll fetch a new one.
+    """
+    @wraps(func)
+    def func_wrapper(self, *args, **kwargs):
+        try:
+            return func(self, *args, **kwargs)
+        except exception.NotAuthorized:
+            # Prevent recursion loop. After the self arg is the
+            # resource_type arg from _issue_api_request(). If attempt to
+            # login failed, we should just give up.
+            if args[0] == 'login':
+                raise
 
-                # Token might've expired, get a new one, try again.
-                self._login()
-                return func(self, *args, **kwargs)
-        return func_wrapper
+            # Token might've expired, get a new one, try again.
+            self._login()
+            return func(self, *args, **kwargs)
+    return func_wrapper
 
 
 class DateraDriver(san.SanISCSIDriver):
+
     """The OpenStack Datera Driver
 
     Version history:
         1.0 - Initial driver
         1.1 - Look for lun-0 instead of lun-1.
+        2.0 - Update For Datera API v2
     """
-    VERSION = '1.1'
+    VERSION = '2.0'
 
     def __init__(self, *args, **kwargs):
         super(DateraDriver, self).__init__(*args, **kwargs)
@@ -93,6 +100,9 @@ class DateraDriver(san.SanISCSIDriver):
         self.password = self.configuration.san_password
         self.auth_token = None
         self.cluster_stats = {}
+
+    def _get_lunid(self):
+        return 0
 
     def do_setup(self, context):
         # If any of the deprecated options are set, we'll warn the operator to
@@ -125,7 +135,9 @@ class DateraDriver(san.SanISCSIDriver):
     @utils.retry(exception.VolumeDriverException, retries=3)
     def _wait_for_resource(self, id, resource_type):
         result = self._issue_api_request(resource_type, 'get', id)
-        if result['status'] == 'available':
+
+        if result['storage_instances'][DEFAULT_STORAGE_NAME]['volumes'][
+                DEFAULT_VOLUME_NAME]['op_state'] == 'available':
             return
         else:
             raise exception.VolumeDriverException(msg=_('Resource not ready.'))
@@ -133,104 +145,184 @@ class DateraDriver(san.SanISCSIDriver):
     def _create_resource(self, resource, resource_type, body):
         result = self._issue_api_request(resource_type, 'post', body=body)
 
-        if result['status'] == 'available':
+        if result['storage_instances'][DEFAULT_STORAGE_NAME]['volumes'][
+                DEFAULT_VOLUME_NAME]['op_state'] == 'available':
             return
         self._wait_for_resource(resource['id'], resource_type)
 
     def create_volume(self, volume):
         """Create a logical volume."""
-        body = {
-            'name': volume['display_name'] or volume['id'],
-            'size': str(volume['size'] * units.Gi),
-            'uuid': volume['id'],
-            'numReplicas': self.num_replicas
-        }
-        self._create_resource(volume, 'volumes', body)
+        # Generate App Instance, Storage Instance and Volume
+        # Volume ID will be used as the App Instance Name
+        # Storage Instance and Volumes will have standard names
+
+        app_params = \
+            {
+                'create_mode': "openstack",
+                'uuid': str(volume['id']),
+                'name': str(volume['id']),
+                'storage_instances': [
+                    {
+                        'name': DEFAULT_STORAGE_NAME,
+                        'volumes': {
+                            DEFAULT_VOLUME_NAME: {
+                                'name': DEFAULT_VOLUME_NAME,
+                                'size': volume['size'],
+                                'replica_count': int(self.num_replicas),
+                                'snapshot_policies': {
+                                }
+                            }
+                        }
+                    }
+                ]
+            }
+        self._create_resource(volume, 'app_instances', body=app_params)
 
     def create_cloned_volume(self, volume, src_vref):
-        body = {
-            'name': volume['display_name'] or volume['id'],
-            'uuid': volume['id'],
-            'clone_uuid': src_vref['id'],
-            'numReplicas': self.num_replicas
+        clone_src_template = "/app_instances/{}/storage_instances/{" + \
+                             "}/volumes/{}"
+        src = clone_src_template.format(src_vref['id'], DEFAULT_STORAGE_NAME,
+                                        DEFAULT_VOLUME_NAME)
+        data = {
+            'create_mode': 'openstack',
+            'name': str(volume['id']),
+            'uuid': str(volume['id']),
+            'clone_src': src,
+            'access_control_mode': 'allow_all'
         }
-        self._create_resource(volume, 'volumes', body)
+        self._issue_api_request('app_instances', 'post', body=data)
 
     def delete_volume(self, volume):
+        self.detach_volume(None, volume)
+        app_inst = volume['id']
         try:
-            self._issue_api_request('volumes', 'delete', volume['id'])
+            self._issue_api_request('app_instances/{}'.format(app_inst),
+                                    method='delete')
         except exception.NotFound:
             msg = _("Tried to delete volume %s, but it was not found in the "
                     "Datera cluster. Continuing with delete.")
             LOG.info(msg, volume['id'])
 
-    def _do_export(self, context, volume):
-        """Gets the associated account, retrieves CHAP info and updates."""
-        portal = None
-        iqn = None
-        datera_volume = self._issue_api_request('volumes',
-                                                resource=volume['id'])
-        if len(datera_volume['targets']) == 0:
-            export = self._issue_api_request(
-                'volumes', action='export', method='post',
-                body={'ctype': 'TC_BLOCK_ISCSI'}, resource=volume['id'])
-
-            portal = "%s:3260" % export['_ipColl'][0]
-
-            # NOTE(thingee): Refer to the Datera test for a stub of what this
-            # looks like. We're just going to pull the first IP that the Datera
-            # cluster makes available for the portal.
-            iqn = export['targetIds'].itervalues().next()['ids'][0]['id']
-        else:
-            export = self._issue_api_request(
-                'export_configs',
-                resource=datera_volume['targets'][0]
-            )
-            portal = export['endpoint_addrs'][0] + ':3260'
-            iqn = export['endpoint_idents'][0]
-
-        provider_location = '%s %s %s' % (portal, iqn, 0)
-        return {'provider_location': provider_location}
-
     def ensure_export(self, context, volume):
-        return self._do_export(context, volume)
+        """Gets the associated account, retrieves CHAP info and updates."""
+        return self.create_export(context, volume)
 
     def create_export(self, context, volume):
-        return self._do_export(context, volume)
+        url = "app_instances/{}".format(volume['id'])
+        data = {
+            'admin_state': 'online'
+        }
+        app_inst = self._issue_api_request(url, method='put', body=data)
+        storage_instance = app_inst['storage_instances'][
+            DEFAULT_STORAGE_NAME]
+
+        # Portal, IQN, LUNID
+        portal = storage_instance['access']['ips'][0] + ':3260'
+        iqn = storage_instance['access']['iqn']
+
+        provider_location = '%s %s %s' % (portal, iqn, self._get_lunid())
+        return {'provider_location': provider_location}
 
     def detach_volume(self, context, volume, attachment=None):
+        url = "app_instances/{}".format(volume['id'])
+        data = {
+            'admin_state': 'offline',
+            'force': True
+        }
         try:
-            self._issue_api_request('volumes', 'delete', resource=volume['id'],
-                                    action='export')
+            self._issue_api_request(url, method='put', body=data)
         except exception.NotFound:
-            msg = _("Tried to delete export for volume %s, but it was not "
-                    "found in the Datera cluster. Continuing with volume "
-                    "detach")
+            msg = _("Tried to detach volume %s, but it was not found in the "
+                    "Datera cluster. Continuing with detach.")
             LOG.info(msg, volume['id'])
 
+    def create_snapshot(self, snapshot):
+        url_template = 'app_instances/{}/storage_instances/{}/volumes/{' \
+                       '}/snapshots'
+        url = url_template.format(snapshot['volume_id'],
+                                  DEFAULT_STORAGE_NAME,
+                                  DEFAULT_VOLUME_NAME)
+
+        snap_params = {
+            'uuid': snapshot['id'],
+        }
+        self._issue_api_request(url, method='post', body=snap_params)
+
     def delete_snapshot(self, snapshot):
+        snap_temp = 'app_instances/{}/storage_instances/{}/volumes/{' \
+                    '}/snapshots'
+        snapu = snap_temp.format(snapshot['volume_id'],
+                                 DEFAULT_STORAGE_NAME,
+                                 DEFAULT_VOLUME_NAME)
+
         try:
-            self._issue_api_request('snapshots', 'delete', snapshot['id'])
+            snapshots = self._issue_api_request(snapu, method='get')
+            for ts, snap in snapshots.viewitems():
+                if snap['uuid'] == snapshot['id']:
+                    url_template = snapu + '/{}'
+                    url = url_template.format(ts)
+                    self._issue_api_request(url, method='delete')
+                    break
+            else:
+                raise exception.NotFound
         except exception.NotFound:
-            msg = _("Tried to delete snapshot %s, but was not found in Datera "
-                    "cluster. Continuing with delete.")
+            msg = _LI("Tried to delete snapshot %s, but was not found in "
+                      "Datera cluster. Continuing with delete.")
             LOG.info(msg, snapshot['id'])
 
-    def create_snapshot(self, snapshot):
-        body = {
-            'uuid': snapshot['id'],
-            'parentUUID': snapshot['volume_id']
-        }
-        self._create_resource(snapshot, 'snapshots', body)
-
     def create_volume_from_snapshot(self, volume, snapshot):
-        body = {
-            'name': volume['display_name'] or volume['id'],
-            'uuid': volume['id'],
-            'snapshot_uuid': snapshot['id'],
-            'numReplicas': self.num_replicas
+        snap_temp = 'app_instances/{}/storage_instances/{}/volumes/{' \
+                    '}/snapshots'
+        snapu = snap_temp.format(snapshot['volume_id'],
+                                 DEFAULT_STORAGE_NAME,
+                                 DEFAULT_VOLUME_NAME)
+
+        snapshots = self._issue_api_request(snapu, method='get')
+        for ts, snap in snapshots.viewitems():
+            if snap['uuid'] == snapshot['id']:
+                found_ts = ts
+                print(found_ts)
+                break
+        else:
+            raise exception.NotFound
+
+        src = '/app_instances/{}/storage_instances/{}/volumes/{' \
+            '}/snapshots/{}'.format(
+                snapshot['volume_id'],
+                DEFAULT_STORAGE_NAME,
+                DEFAULT_VOLUME_NAME,
+                found_ts)
+        app_params = \
+            {
+                'create_mode': 'openstack',
+                'uuid': str(volume['id']),
+                'name': str(volume['id']),
+                'clone_src': src,
+                'access_control_mode': 'allow_all'
+            }
+        self._issue_api_request('app_instances', method='post', body=app_params)
+
+    def extend_volume(self, volume, new_size):
+        # Offline App Instance, if necessary
+        reonline = False
+        app_inst = self._issue_api_request(
+            "app_instances/{}".format(volume['id']))
+        if app_inst['admin_state'] == 'online':
+            reonline = True
+            self.detach_volume(None, volume)
+        # Change Volume Size
+        app_inst = volume['id']
+        storage_inst = DEFAULT_STORAGE_NAME
+        data = {
+            'size': new_size
         }
-        self._create_resource(volume, 'volumes', body)
+        self._issue_api_request(
+            'app_instances/{}/storage_instances/{}/volumes/{}'.format(
+                app_inst, storage_inst, DEFAULT_VOLUME_NAME),
+            method='put', body=data)
+        # Online Volume, if it was online before
+        if reonline:
+            self.create_export(None, volume)
 
     def get_volume_stats(self, refresh=False):
         """Get volume stats.
@@ -240,26 +332,18 @@ class DateraDriver(san.SanISCSIDriver):
         the majority of the data here is cluster
         data.
         """
-        if refresh:
+        if refresh or not self.cluster_stats:
             try:
                 self._update_cluster_stats()
             except exception.DateraAPIException:
                 LOG.error('Failed to get updated stats from Datera cluster.')
-                pass
 
         return self.cluster_stats
-
-    def extend_volume(self, volume, new_size):
-        body = {
-            'size': str(new_size * units.Gi)
-        }
-        self._issue_api_request('volumes', 'put', body=body,
-                                resource=volume['id'])
 
     def _update_cluster_stats(self):
         LOG.debug("Updating cluster stats info.")
 
-        results = self._issue_api_request('cluster')
+        results = self._issue_api_request('system')
 
         if 'uuid' not in results:
             LOG.error(_LE('Failed to get updated stats from Datera Cluster.'))
@@ -270,8 +354,8 @@ class DateraDriver(san.SanISCSIDriver):
             'vendor_name': 'Datera',
             'driver_version': self.VERSION,
             'storage_protocol': 'iSCSI',
-            'total_capacity_gb': int(results['totalRawSpace']),
-            'free_capacity_gb': int(results['availableSpace']),
+            'total_capacity_gb': int(results['total_capacity']) / units.Gi,
+            'free_capacity_gb': int(results['available_capacity']) / units.Gi,
             'reserved_percentage': 0,
         }
 
@@ -290,9 +374,10 @@ class DateraDriver(san.SanISCSIDriver):
 
         try:
             LOG.debug('Getting Datera auth token.')
-            results = self._issue_api_request('login', 'post', body=body,
+            results = self._issue_api_request('login', 'put', body=body,
                                               sensitive=True)
             self.auth_token = results['key']
+            self.configuration.datera_api_token = results['key']
         except exception.NotAuthorized:
             with excutils.save_and_reraise_exception():
                 LOG.error(_LE('Logging into the Datera cluster failed. Please '
@@ -323,10 +408,7 @@ class DateraDriver(san.SanISCSIDriver):
         if not sensitive:
             LOG.debug("Payload for Datera API call: %s", payload)
 
-        header = {
-            'Content-Type': 'application/json; charset=utf-8',
-            'auth-token': self.auth_token
-        }
+        header = {'Content-Type': 'application/json; charset=utf-8'}
 
         protocol = 'http'
         if self.configuration.driver_use_ssl:
@@ -369,6 +451,9 @@ class DateraDriver(san.SanISCSIDriver):
             LOG.debug("Results of Datera API call: %s", data)
 
         if not response.ok:
+            print(response.url)
+            print(payload)
+            print(vars(response))
             if response.status_code == 404:
                 raise exception.NotFound(data['message'])
             elif response.status_code in [403, 401]:
