@@ -161,6 +161,7 @@ class DateraDriver(san.SanISCSIDriver):
                 'create_mode': "openstack",
                 'uuid': str(volume['id']),
                 'name': str(volume['id']),
+                'access_control_mode': 'allow_all',
                 'storage_instances': [
                     {
                         'name': DEFAULT_STORAGE_NAME,
@@ -177,6 +178,28 @@ class DateraDriver(san.SanISCSIDriver):
                 ]
             }
         self._create_resource(volume, 'app_instances', body=app_params)
+
+    def extend_volume(self, volume, new_size):
+        # Offline App Instance, if necessary
+        reonline = False
+        app_inst = self._issue_api_request(
+            "app_instances/{}".format(volume['id']))
+        if app_inst['admin_state'] == 'online':
+            reonline = True
+            self.detach_volume(None, volume)
+        # Change Volume Size
+        app_inst = volume['id']
+        storage_inst = DEFAULT_STORAGE_NAME
+        data = {
+            'size': new_size
+        }
+        self._issue_api_request(
+            'app_instances/{}/storage_instances/{}/volumes/{}'.format(
+                app_inst, storage_inst, DEFAULT_VOLUME_NAME),
+            method='put', body=data)
+        # Online Volume, if it was online before
+        if reonline:
+            self.create_export(None, volume)
 
     def create_cloned_volume(self, volume, src_vref):
         clone_src_template = "/app_instances/{}/storage_instances/{" + \
@@ -255,8 +278,9 @@ class DateraDriver(san.SanISCSIDriver):
                                  DEFAULT_STORAGE_NAME,
                                  DEFAULT_VOLUME_NAME)
 
+        snapshots = self._issue_api_request(snapu, method='get')
+
         try:
-            snapshots = self._issue_api_request(snapu, method='get')
             for ts, snap in snapshots.viewitems():
                 if snap['uuid'] == snapshot['id']:
                     url_template = snapu + '/{}'
@@ -301,28 +325,6 @@ class DateraDriver(san.SanISCSIDriver):
                 'access_control_mode': 'allow_all'
             }
         self._issue_api_request('app_instances', method='post', body=app_params)
-
-    def extend_volume(self, volume, new_size):
-        # Offline App Instance, if necessary
-        reonline = False
-        app_inst = self._issue_api_request(
-            "app_instances/{}".format(volume['id']))
-        if app_inst['admin_state'] == 'online':
-            reonline = True
-            self.detach_volume(None, volume)
-        # Change Volume Size
-        app_inst = volume['id']
-        storage_inst = DEFAULT_STORAGE_NAME
-        data = {
-            'size': new_size
-        }
-        self._issue_api_request(
-            'app_instances/{}/storage_instances/{}/volumes/{}'.format(
-                app_inst, storage_inst, DEFAULT_VOLUME_NAME),
-            method='put', body=data)
-        # Online Volume, if it was online before
-        if reonline:
-            self.create_export(None, volume)
 
     def get_volume_stats(self, refresh=False):
         """Get volume stats.
