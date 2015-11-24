@@ -162,8 +162,8 @@ class DateraDriver(san.SanISCSIDriver):
                 'uuid': str(volume['id']),
                 'name': str(volume['id']),
                 'access_control_mode': 'allow_all',
-                'storage_instances': [
-                    {
+                'storage_instances': {
+                    DEFAULT_STORAGE_NAME: {
                         'name': DEFAULT_STORAGE_NAME,
                         'volumes': {
                             DEFAULT_VOLUME_NAME: {
@@ -175,7 +175,7 @@ class DateraDriver(san.SanISCSIDriver):
                             }
                         }
                     }
-                ]
+                }
             }
         self._create_resource(volume, 'app_instances', body=app_params)
 
