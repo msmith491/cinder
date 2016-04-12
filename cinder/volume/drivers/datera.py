@@ -374,15 +374,18 @@ class DateraDriver(san.SanISCSIDriver):
 
         if not template and connector and connector.get('ip'):
             # Determine IP Pool from IP and update storage_instance
-            initiator_ip_pool_path = self._get_ip_pool_for_string_ip(
-                connector['ip'])
+            try:
+                initiator_ip_pool_path = self._get_ip_pool_for_string_ip(
+                    connector['ip'])
 
-            ip_pool_url = URL_TEMPLATES['si_inst'].format(
-                volume['id'])
-            ip_pool_data = {'ip_pool': initiator_ip_pool_path}
-            self._issue_api_request(ip_pool_url,
-                                    method="put",
-                                    body=ip_pool_data)
+                ip_pool_url = URL_TEMPLATES['si_inst'].format(
+                    volume['id'])
+                ip_pool_data = {'ip_pool': initiator_ip_pool_path}
+                self._issue_api_request(ip_pool_url,
+                                        method="put",
+                                        body=ip_pool_data)
+            except exception.DateraAPIException:
+                pass
         # Now online the app_instance (which will online all storage_instances)
         multipath = connector.get('multipath', False)
         url = URL_TEMPLATES['ai_inst'].format(volume['id'])
